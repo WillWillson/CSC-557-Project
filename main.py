@@ -70,7 +70,43 @@ class RBC:
             node.on_rbc_delivery(self.owner, share)
 
 # -------------------------
-# Byzantine-Tolerant ABBA
+# Common Coin for Byzantine Agreement
+# -------------------------
+
+class CommonCoin:
+    def __init__(self, n: int, t: int):
+        self.n = n
+        self.t = t
+        self.coin_shares: Dict[int, int] = {}  # Node ID -> coin share
+        self._coin_value: Optional[int] = None
+        
+    def contribute_share(self, node_id: int, round_num: int):
+        """Each node contributes a deterministic share based on node ID and round"""
+        # Use a simple but deterministic function for the coin share
+        # In practice, this would use threshold signatures or VRF
+        share = (node_id * 7 + round_num * 13) % 2
+        self.coin_shares[node_id] = share
+        print(f"[CommonCoin] Node {node_id} contributed share {share} for round {round_num}")
+        self._try_compute_coin()
+    
+    def _try_compute_coin(self):
+        """Compute coin value when we have enough shares"""
+        if len(self.coin_shares) >= self.t + 1 and self._coin_value is None:
+            # XOR all shares to get coin value (simple but effective)
+            coin_value = 0
+            for share in list(self.coin_shares.values())[:self.t + 1]:
+                coin_value ^= share
+            self._coin_value = coin_value
+            print(f"[CommonCoin] Computed coin value: {self._coin_value}")
+    
+    def get_coin_value(self) -> Optional[int]:
+        return self._coin_value
+    
+    def has_coin_value(self) -> bool:
+        return self._coin_value is not None
+
+# -------------------------
+# Simplified ABBA with Common Coin
 # -------------------------
 
 class ABBA:
@@ -80,36 +116,62 @@ class ABBA:
         self.t = t
         self.inputs: Dict[int, int] = {}  # sender_id -> vote
         self._output: Optional[int] = None
+        self.common_coin = CommonCoin(n, t)
+        self.coin_requested = False
 
     def input(self, sender: int, v: int):
-        # Accept a binary vote from a sender
+        """Accept a binary vote from a sender"""
         if sender in self.inputs:
             return
         self.inputs[sender] = v
         print(f"[ABBA-{self.owner}] Received vote {v} from Node {sender}")
+        
+        # Contribute to common coin when we receive our first input
+        if not self.coin_requested:
+            self.common_coin.contribute_share(sender, 1)  # Simple round 1
+            self.coin_requested = True
+        
         self._try_decide()
 
     def _try_decide(self):
-        # Try to reach consensus based on received votes
+        """Try to reach consensus based on received votes"""
         if self._output is not None:
             return
+            
         ones = sum(1 for v in self.inputs.values() if v == 1)
         zeros = sum(1 for v in self.inputs.values() if v == 0)
         total_votes = len(self.inputs)
         print(f"[ABBA-{self.owner}] Current votes: {ones} ones, {zeros} zeros, {total_votes} total")
-        if ones >= self.t + 1:
+        
+        # Strong majority decisions
+        if ones >= self.n - self.t:
             self._output = 1
-            print(f"[ABBA-{self.owner}] Decided 1 (ones={ones} >= {self.t + 1})")
+            print(f"[ABBA-{self.owner}] Decided 1 (ones={ones} >= {self.n - self.t})")
         elif zeros >= self.n - self.t:
             self._output = 0
             print(f"[ABBA-{self.owner}] Decided 0 (zeros={zeros} >= {self.n - self.t})")
+        elif total_votes >= self.n - self.t:
+            # Use common coin for tie-breaking when we have enough votes
+            if self.common_coin.has_coin_value():
+                coin_value = self.common_coin.get_coin_value()
+                print(f"[ABBA-{self.owner}] Using common coin value {coin_value} to break tie")
+                if ones >= self.t + 1:
+                    self._output = 1
+                    print(f"[ABBA-{self.owner}] Decided 1 using coin (ones={ones} >= {self.t + 1})")
+                elif zeros >= self.t + 1:
+                    self._output = 0  
+                    print(f"[ABBA-{self.owner}] Decided 0 using coin (zeros={zeros} >= {self.t + 1})")
+                else:
+                    # Fallback to coin value
+                    self._output = coin_value
+                    print(f"[ABBA-{self.owner}] Decided {coin_value} using coin fallback")
 
     def has_output(self) -> bool:
-        # Check if this ABBA instance has made a decision
+        """Check if this ABBA instance has made a decision"""
         return self._output is not None
 
     def get_output(self) -> Optional[int]:
-        # Get the decision (0 or 1)
+        """Get the decision (0 or 1)"""
         return self._output
 
 # -------------------------
@@ -197,23 +259,33 @@ class OciorABAStarNode:
         # Send vote to all nodes' ABBA instances for this sender
         for node in NODES.values():
             node.abba[sender].input(self.id, vote)
-            node._process_abba()  # Check for new ABBA decisions after each vote
+        
+        # Check for new ABBA decisions after each vote
+        self._process_abba()
 
     def _process_abba(self):
-        # Process ABBA decisions and inject default votes as soon as any output appears
+        # Process ABBA decisions
         new_outputs = False
         for j, ab in self.abba.items():
             if j not in self.abba_out and ab.has_output():
                 self.abba_out[j] = ab.get_output()  # type: ignore
                 print(f"[Node {self.id}] ABBA[{j}] output = {self.abba_out[j]}")
                 new_outputs = True
-        # Inject default votes for undecided ABBA as soon as any output appears
-        if new_outputs or len(self.abba_out) > 0:
-            for j in range(1, self.n + 1):
-                if j not in self.abba_out:
-                    self.abba[j].input(self.id, 0)  # Force 0 if undecided
+        
+        # Aggressive termination: inject default votes for undecided ABBA
+        self._inject_default_votes()
+        
+        # Check if all ABBA instances have decided
         if len(self.abba_out) == self.n:
             self._finalize()
+    
+    def _inject_default_votes(self):
+        # Inject default votes (0) for undecided ABBA instances
+        if len(self.abba_out) > 0:  # As soon as any ABBA decides
+            for j in range(1, self.n + 1):
+                if j not in self.abba_out:
+                    # Always inject 0 to force decision
+                    self.abba[j].input(self.id, 0)
 
     def _finalize(self):
         # Finalize the decision based on ABBA outputs
@@ -283,6 +355,11 @@ if __name__ == "__main__":
     interval = 0.1
     elapsed = 0.0
     while not all(node.protocol_complete for node in NODES.values()) and elapsed < timeout:
+        # Continuously process ABBA decisions and inject defaults
+        for node in NODES.values():
+            if not node.protocol_complete:
+                node._process_abba()
+        
         sleep(interval)
         elapsed += interval
 
